@@ -1,0 +1,1 @@
+-O0 -Wall -glldb -fstandalone-debug   -MMD -MP -MF .d -I/opt/homebrew/include -I/opt/homebrew/include -I/opt/homebrew/include   -isystem /Users/thomasbeyene/omnetpp-6.0.3/tools/macos.x86_64/include -fno-omit-frame-pointer  -DWITH_QTENV -DWITH_NETBUILDER -DOMNETPPLIBS_IMPORT -DVEINS_EXPORT -I. -I. -I/Users/thomasbeyene/omnetpp-6.0.3/include

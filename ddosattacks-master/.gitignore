@@ -1,0 +1,10 @@
+/doc/
+/out/
+/.settings/
+
+*.anf
+.[!g]*
+*.txt
+Makefile
+*.vc
+*.cfg
