@@ -8,8 +8,9 @@ import inet.visualizer.integrated.IntegratedVisualizer;
 import inet.applications.pingapp.PingApp;
 import inet.linklayer.ethernet.EtherBus;
 import inet.node.ethernet.EtherLink;
+import org.car2x.veins.nodes.Scenario;
 
-network ScenarioBlackHoleAttack
+network ScenarioBlackHoleAttack extends Scenario
 {
     submodules:
         vehicle[10]: Vehicle {

@@ -8,8 +8,9 @@ import inet.visualizer.integrated.IntegratedVisualizer;
 import inet.applications.pingapp.PingApp;
 import inet.linklayer.ethernet.EtherBus;
 import inet.node.ethernet.EtherLink;
+import org.car2x.veins.nodes.Scenario;
 
-network TcpSynAttack
+network TcpSynAttack extends Scenario
 {
     parameters:
         int numSubnet1Attackers;

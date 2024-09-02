@@ -6,8 +6,9 @@ import inet.node.inet.Router;
 import inet.node.ethernet.EtherSwitch;
 import inet.visualizer.integrated.IntegratedVisualizer;
 import inet.node.ethernet.Eth10M;
+import org.car2x.veins.nodes.Scenario;
 
-network UdpFlood
+network UdpFlood extends Scenario
 {
     parameters:
         int clients_lan1; 
