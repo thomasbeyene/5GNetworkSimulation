@@ -13,18 +13,6 @@ import org.car2x.veins.nodes.Scenario;
 network ScenarioBlackHoleAttack extends Scenario
 {
     submodules:
-        vehicle[10]: Vehicle {
-            // Vehicle-specific parameters
-        }
-        rsu: RSU {
-            // RSU parameters
-        }
-        lteBaseStation: LteBaseStation {
-            // 5G base station parameters
-        }
-        coreNetwork: LteCoreNetwork {
-            // Core network parameters
-        }
         dosAttacker: DosBlackHoleAttacker {
             @display("p=100,100");
             targetNode = "vehicle[0]";

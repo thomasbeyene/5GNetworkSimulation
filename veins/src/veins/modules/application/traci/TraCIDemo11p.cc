@@ -1,375 +1,237 @@
 #include "veins/modules/application/traci/TraCIDemo11p.h"
+
+// Crypto++ headers
+#include <cryptopp/osrng.h>
 #include <cryptopp/eccrypto.h>
 #include <cryptopp/oids.h>
-#include <cryptopp/osrng.h>
 #include <cryptopp/sha.h>
-#include <cryptopp/hex.h>
-#include <cryptopp/files.h>
+#include <cryptopp/hkdf.h>
 #include <cryptopp/aes.h>
 #include <cryptopp/modes.h>
 #include <cryptopp/filters.h>
-#include <cryptopp/cryptlib.h>
-#include <cryptopp/hex.h>
 #include <cryptopp/secblock.h>
-#include <cryptopp/modes.h>
-#include <cryptopp/aes.h>
-#include <cryptopp/modes.h>
-#include <cryptopp/osrng.h>
-#include <cryptopp/hkdf.h>
-#include <map>
 
-std::map<LAddress::L2Type, CryptoPP::SecByteBlock> sessionKeys;
-std::map<LAddress::L2Type, CryptoPP::byte*> sessionIVs;
-std::map<LAddress::L2Type, simtime_t> sessionTimestamps;
-std::map<LAddress::L2Type, int> messageCounts;
-int keyRotationThreshold = 100; // Number of messages after which the key should be rotated
-simtime_t sessionDuration = 300; // Session duration in seconds (example: 5 minutes)
+using Veins::TraCIMobilityAccess;
+using Veins::AnnotationManagerAccess;
+using namespace CryptoPP;
 
-using namespace veins;
+const simsignalwrap_t TraCIDemo11p::parkingStateChangedSignal = simsignalwrap_t(TRACI_SIGNAL_PARKING_CHANGE_NAME);
 
-Define_Module(veins::TraCIDemo11p);
+Define_Module(TraCIDemo11p);
 
-void TraCIDemo11p::initialize(int stage)
-{
+void TraCIDemo11p::initialize(int stage) {
     DemoBaseApplLayer::initialize(stage);
     if (stage == 0) {
-        //stage 0 - Here the vehicles still do not have the link layer id (myId)
+        mobility = TraCIMobilityAccess().get(getParentModule());
+        traci = mobility->getCommandInterface();
+        traciVehicle = mobility->getVehicleCommandInterface();
+        annotations = AnnotationManagerAccess().getIfExists();
+        ASSERT(annotations);
+
         sentMessage = false;
         lastDroveAt = simTime();
-        currentSubscribedServiceId = -1;
+        findHost()->subscribe(parkingStateChangedSignal, this);
+        isParking = false;
+        sendWhileParking = par("sendWhileParking").boolValue();
 
-        // ECDSA key generation
+        // ECDH Key Generation
         AutoSeededRandomPool prng;
-        privateKey.Initialize(prng, ASN1::secp256r1());
-        privateKey.MakePublicKey(publicKey);
+        dh = new ECDH<ECP>::Domain(ASN1::secp256r1());
 
-        // ECDH key pair generation
-        ecdhPrivateKey.Initialize(prng, ASN1::secp256r1());
-        ecdhPrivateKey.MakePublicKey(ecdhPublicKey);
+        privateKey = SecByteBlock(dh->PrivateKeyLength());
+        publicKey = SecByteBlock(dh->PublicKeyLength());
+        dh->GenerateKeyPair(prng, privateKey, publicKey);
 
-        // AES-256 key and IV generation
-        key = SecByteBlock(32);  // 32 bytes for AES-256
-        iv = new byte[16];       // AES block size is 16 bytes
-        prng.GenerateBlock(key, key.size());
-        prng.GenerateBlock(iv, 16);
+        // ECDSA Key Generation
+        ecdsaPrivateKey.Initialize(prng, ASN1::secp256r1());
+        ecdsaPrivateKey.MakePublicKey(ecdsaPublicKey);
 
-    } else {
-        //stage 1 - Here the vehicle already have the link layer ID (myId)
+        // Send the public key to other nodes
+        sendPublicKey();
     }
 }
 
-std::string TraCIDemo11p::signMessage(TraCIDemo11pMessage* wsm)
-{
-    std::string message = std::to_string(wsm->getSenderAddress()) + ";" + wsm->getDemoData();
-    // Encrypt the message with AES-256
-    std::string encryptedMessage = AES256Encryption(message, key, iv);
+void TraCIDemo11p::sendPublicKey() {
+    // Serialize ECDH public key
+    std::string publicKeyString(reinterpret_cast<const char*>(publicKey.data()), publicKey.size());
 
-    std::string signature;
+    // Serialize ECDSA public key
+    std::string ecdsaPublicKeyString;
+    ecdsaPublicKey.Save(StringSink(ecdsaPublicKeyString).Ref());
 
+    WaveShortMessage* wsm = prepareWSM("public_key", (publicKeyString.size() + ecdsaPublicKeyString.size()) * 8, type_CCH, dataPriority, -1, 2);
+    wsm->setWsmData((publicKeyString + ecdsaPublicKeyString).c_str()); // Combine both keys
+    sendWSM(wsm);
+}
+
+void TraCIDemo11p::onData(WaveShortMessage* wsm) {
+    std::string wsmType = wsm->getName();
+
+    if (wsmType == "public_key") {
+        // Extract ECDH public key
+        std::string receivedData = wsm->getWsmData();
+        std::string receivedECDHPublicKeyStr = receivedData.substr(0, dh->PublicKeyLength());
+        receivedPublicKey = SecByteBlock(reinterpret_cast<const byte*>(receivedECDHPublicKeyStr.data()), receivedECDHPublicKeyStr.size());
+
+        // Extract ECDSA public key
+        std::string receivedECDSAPublicKeyStr = receivedData.substr(dh->PublicKeyLength());
+        StringSource source(receivedECDSAPublicKeyStr, true /*pumpAll*/);
+        receivedECDSAPublicKey.BERDecode(source);
+
+        // Derive the shared secret
+        deriveSharedSecret();
+
+    } else if (wsmType == "data") {
+        // Verify and decrypt the message
+        if (!verifyAndDecryptMessage(wsm)) {
+            EV_ERROR << "Message verification failed. Dropping the message." << std::endl;
+            return;
+        }
+
+        std::string decryptedData = wsm->getWsmData();
+        findHost()->getDisplayString().updateWith("r=16,green");
+        annotations->scheduleErase(1, annotations->drawLine(wsm->getSenderPos(), mobility->getPositionAt(simTime()), "blue"));
+
+        if (mobility->getRoadId()[0] != ':') {
+            traciVehicle->changeRoute(decryptedData, 9999);
+        }
+        if (!sentMessage) {
+            sendMessage(decryptedData);
+        }
+    }
+}
+
+void TraCIDemo11p::deriveSharedSecret() {
+    sharedSecret = SecByteBlock(dh->AgreedValueLength());
+    if (!dh->Agree(sharedSecret, privateKey, receivedPublicKey)) {
+        throw std::runtime_error("Failed to reach shared secret.");
+    }
+
+    // Derive AES key from the shared secret
+    aesKey = SecByteBlock(AES::DEFAULT_KEYLENGTH);
+    HKDF<SHA256> hkdf;
+    hkdf.DeriveKey(aesKey, aesKey.size(), sharedSecret, sharedSecret.size(), nullptr, 0, nullptr, 0);
+}
+
+void TraCIDemo11p::sendMessage(std::string blockedRoadId) {
+    sentMessage = true;
+
+    t_channel channel = dataOnSch ? type_SCH : type_CCH;
+    WaveShortMessage* wsm = prepareWSM("data", dataLengthBits, channel, dataPriority, -1, 2);
+
+    // Encrypt and sign the message
+    encryptAndSignMessage(wsm, blockedRoadId);
+
+    sendWSM(wsm);
+}
+
+void TraCIDemo11p::encryptAndSignMessage(WaveShortMessage* wsm, const std::string& data) {
+    // Encrypt the message
     AutoSeededRandomPool prng;
-    ECDSA<ECP, SHA256>::Signer signer(privateKey);
+    std::string plaintext = data;
+    std::string ciphertext;
 
-    // Sign message
-    StringSource(message, true,
+    byte iv[AES::BLOCKSIZE];
+    prng.GenerateBlock(iv, sizeof(iv)); // Generate a random IV
+
+    CBC_Mode<AES>::Encryption encryption;
+    encryption.SetKeyWithIV(aesKey, aesKey.size(), iv);
+
+    StringSource(plaintext, true,
+        new StreamTransformationFilter(encryption,
+            new StringSink(ciphertext)
+        )
+    );
+
+    // Sign the ciphertext
+    std::string signature;
+    ECDSA<ECP, SHA256>::Signer signer(ecdsaPrivateKey);
+    StringSource ss(ciphertext, true,
         new SignerFilter(prng, signer,
             new StringSink(signature)
         )
     );
 
-    // Convert signature to hex for easy storage and transmission
-    std::string signatureHex;
-    StringSource(signature, true,
-        new HexEncoder(
-            new StringSink(signatureHex)
-        )
-    );
-
-    std::cout << "Message: " << message << std::endl;
-    std::cout << "Signature: " << signatureHex << std::endl;
-    std::cout << "------------------------------" << std::endl;
-
-    // Store the encrypted message in the WSM for transmission
-    wsm->setDemoData(encryptedMessage);
-
-    return signatureHex;
+    // Store ciphertext, IV, and signature in the message
+    wsm->setWsmData(ciphertext.c_str());
+    wsm->addObject(new cStringObject("iv", std::string((const char*)iv, sizeof(iv))));
+    wsm->addObject(new cStringObject("signature", signature));
 }
 
-bool TraCIDemo11p::verifyMessage(TraCIDemo11pMessage* wsm, const std::string& signatureHex)
-{
-    std::string encryptedMessage = std::to_string(wsm->getSenderAddress()) + ";" + wsm->getDemoData();
-    std::string signature;
+bool TraCIDemo11p::verifyAndDecryptMessage(WaveShortMessage* wsm) {
+    // Retrieve ciphertext, IV, and signature from the message
+    std::string ciphertext = wsm->getWsmData();
+    std::string iv = static_cast<cStringObject*>(wsm->getObject("iv"))->getValue();
+    std::string signature = static_cast<cStringObject*>(wsm->getObject("signature"))->getValue();
 
-    // Convert hex signature back to binary
-    StringSource(signatureHex, true,
-        new HexDecoder(
-            new StringSink(signature)
-        )
+    // Verify the signature
+    ECDSA<ECP, SHA256>::Verifier verifier(receivedECDSAPublicKey);
+    bool validSignature = verifier.VerifyMessage(
+        (const byte*)ciphertext.data(), ciphertext.size(),
+        (const byte*)signature.data(), signature.size()
     );
 
-    ECDSA<ECP, SHA256>::Verifier verifier(publicKey);
-
-    // Verify signature
-    bool result = false;
-    StringSource(signature + encryptedMessage, true,
-        new SignatureVerificationFilter(verifier,
-            new ArraySink((byte*)&result, sizeof(result))
-        )
-    );
-
-        if (result) {
-        // If the signature is valid, decrypt the message
-        std::string decryptedMessage = AES256Decryption(encryptedMessage, key, iv);
-        std::cout << "Decrypted Message: " << decryptedMessage << std::endl;
+    if (!validSignature) {
+        EV_ERROR << "Invalid signature!" << std::endl;
+        return false;
     }
 
+    // Decrypt the message
+    std::string decryptedtext;
 
-    return result;
+    CBC_Mode<AES>::Decryption decryption;
+    decryption.SetKeyWithIV(aesKey, aesKey.size(), (byte*)iv.data());
+
+    StringSource(ciphertext, true,
+        new StreamTransformationFilter(decryption,
+            new StringSink(decryptedtext)
+        )
+    );
+
+    // Set the decrypted data back to the message
+    wsm->setWsmData(decryptedtext.c_str());
+
+    return true;
 }
 
-void TraCIDemo11p::storeMsg(TraCIDemo11pMessage* wsm, const std::string& signature)
-{
-    // Get message fields
-    int serialWsm = wsm->getSerial();
-    LAddress::L2Type srcWsm = wsm->getSenderAddress();
-    std::string dataWsm = wsm->getDemoData();
-
-    msgRecord wsm1 = { serialWsm, srcWsm, dataWsm, signature };
-    msgRec[signature] = wsm1;
-}
-
-void TraCIDemo11p::printAllReceivMsg(void)
-{
-    std::map<std::string, msgRecord>::iterator it;
-    std::cout << "Received Messages" << myId << std::endl;
-    std::cout << "MyID:        " << myId << std::endl;
-    for(it = msgRec.begin(); it != msgRec.end(); ++it) {
-        std::cout << "Signature: " << it->first << " | MSG content: " << it->second.data << std::endl;
-        std::cout << "Serial >>>>> " << it->second.serial << std::endl;
-        std::cout << "Src ID >>>>> " << it->second.srcId << std::endl;
-        std::cout << "-------------" << std::endl;
+void TraCIDemo11p::receiveSignal(cComponent* source, simsignal_t signalID, cObject* obj, cObject* details) {
+    Enter_Method_Silent();
+    if (signalID == mobilityStateChangedSignal) {
+        handlePositionUpdate(obj);
+    } else if (signalID == parkingStateChangedSignal) {
+        handleParkingUpdate(obj);
     }
 }
 
-void TraCIDemo11p::onWSM(BaseFrame1609_4* frame)
-{
-    TraCIDemo11pMessage* wsm = check_and_cast<TraCIDemo11pMessage*>(frame);
-    LAddress::L2Type senderAddress = wsm->getSenderAddress();
-    simtime_t currentTime = simTime();
-
-    findHost()->getDisplayString().setTagArg("i", 1, "green"); // if message was received and readable, car color = green
-
-    // Check if the session has expired
-    if (sessionKeys.find(senderAddress) != sessionKeys.end()) {
-        if (currentTime - sessionTimestamps[senderAddress] > sessionDuration) {
-            std::cout << "Session expired for sender: " << senderAddress << ". Establishing new session." << std::endl;
-            // Remove the old session
-            sessionKeys.erase(senderAddress);
-            sessionIVs.erase(senderAddress);
-            sessionTimestamps.erase(senderAddress);
-            messageCounts.erase(senderAddress);
+void TraCIDemo11p::handleParkingUpdate(cObject* obj) {
+    isParking = mobility->getParkingState();
+    if (sendWhileParking == false) {
+        if (isParking == true) {
+            (FindModule<BaseConnectionManager*>::findGlobalModule())->unregisterNic(this->getParentModule()->getSubmodule("nic"));
+        } else {
+            Coord pos = mobility->getCurrentPosition();
+            (FindModule<BaseConnectionManager*>::findGlobalModule())->registerNic(this->getParentModule()->getSubmodule("nic"), (ChannelAccess*) this->getParentModule()->getSubmodule("nic")->getSubmodule("phy80211p"), &pos);
         }
     }
-
-    if (sessionKeys.find(senderAddress) == sessionKeys.end()) { // If session not established yet
-        receiveAndComputeSharedSecret(wsm);
-    } else {
-        // Optionally, implement key rotation based on message count or other policies
-        messageCounts[senderAddress]++;
-        if (messageCounts[senderAddress] >= keyRotationThreshold) {
-            std::cout << "Rotating key for sender: " << senderAddress << std::endl;
-            // Recompute shared secret and rotate key
-            receiveAndComputeSharedSecret(wsm);
-            messageCounts[senderAddress] = 0; // Reset the counter after key rotation
-        }
-    }
-
-    // Encrypt, sign, and verify message after key exchange
-    std::string signature = signMessage(wsm);
-    storeMsg(wsm, signature);
-
-    // Verification example
-    if (verifyMessage(wsm, signature)) {
-        std::cout << "Message verified successfully." << std::endl;
-    } else {
-        std::cout << "Message verification failed." << std::endl;
-    }
 }
 
-
-void TraCIDemo11p::handleSelfMsg(cMessage* msg)
-{
-    if (TraCIDemo11pMessage* wsm = dynamic_cast<TraCIDemo11pMessage*>(msg)) {
-        // Process received message
-    } else {
-        DemoBaseApplLayer::handleSelfMsg(msg);
-    }
-}
-
-void TraCIDemo11p::handlePositionUpdate(cObject* obj)
-{
+void TraCIDemo11p::handlePositionUpdate(cObject* obj) {
     DemoBaseApplLayer::handlePositionUpdate(obj);
 
-    // If stopped vehicle
+    // stopped for for at least 10s?
     if (mobility->getSpeed() < 1) {
-        // Vehicle stopped for at least 10s?
-        if (simTime() - lastDroveAt >= 10 && sentMessage == false) {
-            findHost()->getDisplayString().setTagArg("i", 1, "red");  // Car color = red
+        if (simTime() - lastDroveAt >= 10) {
+            findHost()->getDisplayString().updateWith("r=16,red");
+            if (!sentMessage) {
+                sendMessage(mobility->getRoadId());
+            }
         }
     } else {
         lastDroveAt = simTime();
     }
 }
 
-std::string TraCIDemo11p::AES256Encryption(std::string &plain, CryptoPP::SecByteBlock key, CryptoPP::byte *iv) {
-    std::string cipher;
-    std::string output;
-
-    try {
-        CryptoPP::CBC_Mode<CryptoPP::AES>::Encryption e(key, key.size(), iv);
-
-        CryptoPP::StringSource(plain, true,
-            new CryptoPP::StreamTransformationFilter(e,
-                new CryptoPP::StringSink(cipher)
-            ) 
-        ); 
-    } catch (CryptoPP::Exception &exception) {
-        std::cerr << exception.what() << std::endl;
-        exit(1);
-    }
-
-    CryptoPP::StringSource(cipher, true,
-        new CryptoPP::HexEncoder(
-            new CryptoPP::StringSink(output)
-        ) 
-    ); 
-    return output;
+void TraCIDemo11p::sendWSM(WaveShortMessage* wsm) {
+    if (isParking && !sendWhileParking) return;
+    sendDelayedDown(wsm, individualOffset);
 }
-
-std::string TraCIDemo11p::AES256Decryption(std::string &encoded, CryptoPP::SecByteBlock key, CryptoPP::byte *iv) {
-    std::string cipher;
-    std::string output;
-
-    CryptoPP::StringSource(encoded, true,
-        new CryptoPP::HexDecoder(
-            new CryptoPP::StringSink(cipher)
-        ) 
-    ); 
-
-    try {
-        CryptoPP::CBC_Mode<CryptoPP::AES>::Decryption d(key, key.size(), iv);
-        CryptoPP::StringSource(cipher, true,
-            new CryptoPP::StreamTransformationFilter(d,
-                new CryptoPP::StringSink(output)
-            ) 
-        ); 
-    } catch (CryptoPP::Exception &exception) {
-        std::cerr << exception.what() << std::endl;
-        exit(1);
-    }
-    return output;
-}
-
-void TraCIDemo11p::exchangeKeys(TraCIDemo11pMessage* wsm)
-{
-    // Convert the public key to string (for transmission)
-    std::string encodedPublicKey;
-    StringSource(ecdhPublicKey, sizeof(ecdhPublicKey), true,
-                 new HexEncoder(
-                     new StringSink(encodedPublicKey)
-                 ));
-
-    // Sign the public key using the ECDSA private key
-    std::string signature;
-    AutoSeededRandomPool prng;
-    ECDSA<ECP, SHA256>::Signer signer(privateKey);
-    StringSource(encodedPublicKey, true,
-                 new SignerFilter(prng, signer,
-                                  new StringSink(signature)
-                 ));
-
-    // Convert the signature to hex for transmission
-    std::string signatureHex;
-    StringSource(signature, true,
-                 new HexEncoder(
-                     new StringSink(signatureHex)
-                 ));
-
-    // Combine the encoded public key and its signature for transmission
-    std::string dataToSend = encodedPublicKey + ":" + signatureHex;
-    wsm->setDemoData(dataToSend);
-}
-
-void TraCIDemo11p::receiveAndComputeSharedSecret(TraCIDemo11pMessage* wsm)
-{
-    LAddress::L2Type senderAddress = wsm->getSenderAddress();
-    simtime_t currentTime = simTime();
-
-    // Check if a session already exists with this sender
-    if (sessionKeys.find(senderAddress) != sessionKeys.end()) {
-        // Use the existing session key and IV
-        key = sessionKeys[senderAddress];
-        iv = sessionIVs[senderAddress];
-        std::cout << "Using existing session key and IV for sender: " << senderAddress << std::endl;
-        return;
-    }
-
-    // Extract the public key and signature from the received data
-    std::string receivedData = wsm->getDemoData();
-    size_t separatorPos = receivedData.find(':');
-    if (separatorPos == std::string::npos) {
-        throw std::runtime_error("Invalid message format: missing signature");
-    }
-
-    std::string receivedPublicKeyHex = receivedData.substr(0, separatorPos);
-    std::string receivedSignatureHex = receivedData.substr(separatorPos + 1);
-
-    // Convert the received public key from hex to a point
-    CryptoPP::ECP::Point receivedPublicKey;
-    StringSource(receivedPublicKeyHex, true,
-                 new HexDecoder(
-                     new ArraySink((byte*)&receivedPublicKey, sizeof(receivedPublicKey))
-                 ));
-
-    // Convert the received signature from hex to binary
-    std::string receivedSignature;
-    StringSource(receivedSignatureHex, true,
-                 new HexDecoder(
-                     new StringSink(receivedSignature)
-                 ));
-
-    // Verify the received public key's signature using the sender's ECDSA public key
-    ECDSA<ECP, SHA256>::Verifier verifier(publicKey);
-    bool result = false;
-    StringSource(receivedPublicKeyHex + receivedSignature, true,
-                 new SignatureVerificationFilter(verifier,
-                     new ArraySink((byte*)&result, sizeof(result))
-                 ));
-
-    if (!result) {
-        throw std::runtime_error("Failed to verify public key signature");
-    }
-
-    // Compute the shared secret
-    SecByteBlock sharedSecret(ecdhPrivateKey.AgreedValueLength());
-    if (!ecdhPrivateKey.Agree(sharedSecret, ecdhPrivateKey, receivedPublicKey)) {
-        throw std::runtime_error("Failed to compute shared secret");
-    }
-
-    // Derive AES-256 key from the shared secret using HKDF (HMAC-based Extract-and-Expand Key Derivation Function)
-    HKDF<SHA256> hkdf;
-    key = SecByteBlock(32); // AES-256 key size
-    hkdf.DeriveKey(key, key.size(), sharedSecret, sharedSecret.size(), nullptr, 0, nullptr, 0);
-
-    // Generate a new IV
-    iv = new byte[16]; // AES block size is 16 bytes
-    AutoSeededRandomPool prng;
-    prng.GenerateBlock(iv, 16);
-
-    // Store the session key and IV for future use
-    sessionKeys[senderAddress] = key;
-    sessionIVs[senderAddress] = iv;
-    sessionTimestamps[senderAddress] = currentTime; // Update the session timestamp
-    std::cout << "Session key and IV stored for sender: " << senderAddress << std::endl;
-}
-
-

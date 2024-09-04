@@ -1,77 +1,115 @@
-//
-// Copyright (C) 2016 David Eckhoff <david.eckhoff@fau.de>
-//
-// Documentation for these modules is at http://veins.car2x.org/
-//
-// SPDX-License-Identifier: GPL-2.0-or-later
-//
-// This program is free software; you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation; either version 2 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program; if not, write to the Free Software
-// Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
-//
-//App: @dnat
-
 #include "veins/modules/application/traci/TraCIDemoRSU11p.h"
+#include <cryptopp/osrng.h>
+#include <cryptopp/eccrypto.h>
+#include <cryptopp/oids.h>
+#include <cryptopp/aes.h>
+#include <cryptopp/modes.h>
+#include <cryptopp/filters.h>
+#include <cryptopp/hex.h>
 
-#include "veins/modules/application/traci/TraCIDemo11pMessage_m.h"
+using Veins::AnnotationManagerAccess;
+using namespace CryptoPP;
 
-using namespace veins;
+Define_Module(TraCIDemoRSU11p);
 
-Define_Module(veins::TraCIDemoRSU11p);
-
-/*
- * Modified by: dnatividade
- */
-
-//Two stages execution: stage 0; stage 1
-//This method is called 2 times when the RSU is created
-void TraCIDemoRSU11p::initialize(int stage)
-{
-    DemoBaseApplLayer::initialize(stage);
+void TraCIDemoRSU11p::initialize(int stage) {
+    BaseWaveApplLayer::initialize(stage);
     if (stage == 0) {
-        //stage 0 - Here the RSU still do not have the link layer id (myId)
-    } else {
-        //stage 1 - Here the vehicle already have the link layer ID (myId)
-        TraCIDemo11pMessage* wsm = new TraCIDemo11pMessage(); //create a message called wsm
-        populateWSM(wsm, -1); //fill the principal message fields [wsm = message] [-1 = send to broadcast] [0 = any serial number]
-        wsm->setSenderAddress(myId); //set sender address (me)
-        wsm->setDemoData("Any message"); //set message content
-        scheduleAt(simTime() + 2, wsm); //Make an schedule for 2 seconds from now [using self messages]
+        mobi = dynamic_cast<BaseMobility*> (getParentModule()->getSubmodule("mobility"));
+        ASSERT(mobi);
+        annotations = AnnotationManagerAccess().getIfExists();
+        ASSERT(annotations);
+        sentMessage = false;
+
+        // Crypto++ Initialization
+        AutoSeededRandomPool prng;
+
+        // Generate ECDSA keys
+        ecdsaPrivateKey.Initialize(prng, ASN1::secp256r1());
+        ecdsaPrivateKey.MakePublicKey(ecdsaPublicKey);
+
+        // Generate ECDH keys
+        ecdhPrivateKey.Initialize(prng, ASN1::secp256r1());
+        ecdhPrivateKey.MakePublicKey(ecdhPublicKey);
     }
 }
 
-
-//This method is called when a RSU receive a message
-void TraCIDemoRSU11p::onWSM(BaseFrame1609_4* frame)
-{
-    TraCIDemo11pMessage* wsm = check_and_cast<TraCIDemo11pMessage*>(frame);
+void TraCIDemoRSU11p::onBeacon(WaveShortMessage* wsm) {
+    // Placeholder for beacon handling
 }
 
+void TraCIDemoRSU11p::onData(WaveShortMessage* wsm) {
+    findHost()->getDisplayString().updateWith("r=16,green");
+    annotations->scheduleErase(1, annotations->drawLine(wsm->getSenderPos(), mobi->getCurrentPosition(), "blue"));
 
-//Handle the schedules
-void TraCIDemoRSU11p::handleSelfMsg(cMessage* msg)
-{
-    if (TraCIDemo11pMessage* wsm = dynamic_cast<TraCIDemo11pMessage*>(msg)) {
-        wsmSerial++; //increment message serial
-        wsm->setSerial(wsmSerial); //set message serial (incremental);
+    if (!sentMessage) {
+        // Example of encrypting data using AES-256
+        std::string plaintext = wsm->getWsmData();
+        std::string ciphertext = encryptAES(plaintext);
 
-        sendDown(wsm->dup()); //send the message now
-        //sendDelayedDown(wsm, 0.05); //send message with a fixed delay [0.05 seconds]
-        //sendDelayedDown(wsm, uniform(0.01, 0.2)); //send message with a random delay [between 0.01 and 0.2 seconds]
-        scheduleAt(simTime() + 2, wsm); //Make an schedule for 2 seconds from now [using self messages]
-
-
-    } else {
-        DemoBaseApplLayer::handleSelfMsg(msg);
+        // Sending encrypted message
+        sendMessage(ciphertext);
     }
+}
+
+void TraCIDemoRSU11p::sendMessage(std::string encryptedData) {
+    sentMessage = true;
+    t_channel channel = dataOnSch ? type_SCH : type_CCH;
+    WaveShortMessage* wsm = prepareWSM("data", dataLengthBits, channel, dataPriority, -1, 2);
+
+    // Signing the encrypted data using ECDSA
+    std::string signature = signDataECDSA(encryptedData);
+
+    wsm->setWsmData((encryptedData + ":" + signature).c_str());
+    sendWSM(wsm);
+}
+
+void TraCIDemoRSU11p::sendWSM(WaveShortMessage* wsm) {
+    sendDelayedDown(wsm, individualOffset);
+}
+
+std::string TraCIDemoRSU11p::encryptAES(const std::string& plaintext) {
+    AutoSeededRandomPool prng;
+    SecByteBlock key(AES::DEFAULT_KEYLENGTH);
+    prng.GenerateBlock(key, key.size());
+
+    byte iv[AES::BLOCKSIZE];
+    prng.GenerateBlock(iv, sizeof(iv));
+
+    std::string ciphertext;
+
+    try {
+        CBC_Mode<AES>::Encryption encryption;
+        encryption.SetKeyWithIV(key, key.size(), iv);
+
+        StringSource(plaintext, true,
+            new StreamTransformationFilter(encryption,
+                new StringSink(ciphertext)
+            )
+        );
+    }
+    catch (const CryptoPP::Exception& e) {
+        EV << "AES Encryption Error: " << e.what() << std::endl;
+    }
+
+    return ciphertext;
+}
+
+std::string TraCIDemoRSU11p::signDataECDSA(const std::string& data) {
+    AutoSeededRandomPool prng;
+    std::string signature;
+
+    try {
+        ECDSA<ECP, SHA256>::Signer signer(ecdsaPrivateKey);
+        StringSource(data, true,
+            new SignerFilter(prng, signer,
+                new StringSink(signature)
+            )
+        );
+    }
+    catch (const CryptoPP::Exception& e) {
+        EV << "ECDSA Signing Error: " << e.what() << std::endl;
+    }
+
+    return signature;
 }

@@ -34,7 +34,7 @@ network JammingAttack extends Scenario
         customer[numSubnet1Clients + numSubnet2Clients + numSubnet3Clients]: WirelessHost;
         JammerHost[numSubnet1Jammers + numSubnet2Jammers + numSubnet3Jammers]: NRJammer
 		{
-            @display("i=device/jammer,red;");
+            @display("i=device/drone");
         };
         server: StandardHost
         {

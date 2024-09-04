@@ -1,34 +1,13 @@
-//
-// Copyright (C) 2016 David Eckhoff <david.eckhoff@fau.de>
-//
-// Documentation for these modules is at http://veins.car2x.org/
-//
-// SPDX-License-Identifier: GPL-2.0-or-later
-//
-// This program is free software; you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation; either version 2 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program; if not, write to the Free Software
-// Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
-//
-//App: @dnat
-
 #pragma once
 
 #include "veins/modules/application/ieee80211p/DemoBaseApplLayer.h"
+#include <cryptopp/eccrypto.h>
+#include <cryptopp/aes.h>
 
 namespace veins {
 
 /**
- * Small RSU Demo using 11p
+ * Small RSU Demo using 11p with cryptographic enhancements.
  *
  * Modified by: dnatividade
  */
@@ -36,12 +15,26 @@ class VEINS_API TraCIDemoRSU11p : public DemoBaseApplLayer {
 public:
     void initialize(int stage) override;
 
-public:
-    int wsmSerial = 0; //message serial
+protected:
+    void onBeacon(WaveShortMessage* wsm);
+    void onData(WaveShortMessage* wsm);
+    void sendMessage(std::string encryptedData);
+    void sendWSM(WaveShortMessage* wsm);
+
+    std::string encryptAES(const std::string& plaintext);
+    std::string signDataECDSA(const std::string& data);
 
 protected:
-    void onWSM(BaseFrame1609_4* wsm) override;
-    void handleSelfMsg(cMessage* msg) override;
+    int wsmSerial = 0; // Message serial number
+    bool sentMessage = false; // Track if a message has been sent
+    BaseMobility* mobi = nullptr; // Pointer to the mobility module
+    AnnotationManager* annotations = nullptr; // Pointer to the annotation manager
+
+    // Crypto++ variables
+    CryptoPP::ECDSA<CryptoPP::ECP, CryptoPP::SHA256>::PrivateKey ecdsaPrivateKey;
+    CryptoPP::ECDSA<CryptoPP::ECP, CryptoPP::SHA256>::PublicKey ecdsaPublicKey;
+    CryptoPP::ECDH<CryptoPP::ECP>::PrivateKey ecdhPrivateKey;
+    CryptoPP::ECDH<CryptoPP::ECP>::PublicKey ecdhPublicKey;
 };
 
 } // namespace veins
